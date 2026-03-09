@@ -105,7 +105,7 @@ setup(
     extras_require={'all': ['xarray', 'tifffile', 'matplotlib']},
     platforms=['any'],
     classifiers=[
-        'Development Status :: 3 - Alpha',
+        'Development Status :: 4 - Beta',
         'Intended Audience :: Science/Research',
         'Intended Audience :: Developers',
         'Operating System :: OS Independent',
