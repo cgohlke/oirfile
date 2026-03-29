@@ -29,7 +29,7 @@
 
 """Unittests for the oirfile package.
 
-:Version: 2026.3.8
+:Version: 2026.3.28
 
 """
 
@@ -545,6 +545,30 @@ def test_oir_t_no_c():
         assert METADATA.IMAGEDEFINITION not in xml
         data = oir.asarray()
         assert data.shape == (50, 512, 512)
+
+
+def test_oir_line_scan():
+    """Test OirFile with Y exceeding per-frame height (long line scan)."""
+    fname = DATA / 'arvink1' / 'Fiber_000.oir'
+    if not fname.exists():
+        pytest.skip(f'{fname!r} not found')
+    with OirFile(fname) as oir:
+        assert oir.sizes == {'Y': 20000, 'X': 74}
+        assert oir.shape == (20000, 74)
+        assert oir.dims == ('Y', 'X')
+        assert oir.dtype == numpy.dtype('<u2')
+        coords = oir.coords
+        assert list(coords.keys()) == ['Y', 'X']
+        assert len(coords['Y']) == 20000
+        assert coords['Y'][0] == pytest.approx(0.0)
+        assert coords['Y'][1] == pytest.approx(
+            0.025895023725093 / 2048, rel=0.01
+        )
+        assert len(coords['X']) == 74
+        data = oir.asarray()
+        assert data.shape == (20000, 74)
+        assert data.dtype == numpy.dtype('<u2')
+        assert data.any()
 
 
 def test_oir_empty_dims():
