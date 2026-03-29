@@ -31,13 +31,14 @@
 
 """Read Olympus/Evident OIR and POIR files.
 
-Oirfile is a Python library to read images and metadata from OIR files
-and POIR archives (ZIP collections of OIR files) produced by
-Olympus/Evident FluoView fluorescence microscopy software.
+Oirfile is a Python library to read images and metadata from OIR (Olympus
+Image Format Raw) files and POIR archives (ZIP collections of OIR files)
+produced by Olympus/Evident FluoView fluorescence microscopy software.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.3.8
+:Version: 2026.3.28
+:DOI: `10.5281/zenodo.18916509 <https://doi.org/10.5281/zenodo.18916509>`_
 
 Quickstart
 ----------
@@ -59,13 +60,17 @@ This revision was tested with the following requirements and dependencies
 (other versions may work):
 
 - `CPython <https://www.python.org>`_ 3.12.10, 3.13.12, 3.14.3 64-bit
-- `NumPy <https://pypi.org/project/numpy>`_ 2.4.2
+- `NumPy <https://pypi.org/project/numpy>`_ 2.4.3
 - `Xarray <https://pypi.org/project/xarray>`_ 2026.2.0 (recommended)
 - `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.10.8 (optional)
 - `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.3.3 (optional)
 
 Revisions
 ---------
+
+2026.3.28
+
+- Fix reading long line scan where Y exceeds per-frame height.
 
 2026.3.8
 
@@ -75,31 +80,35 @@ Revisions
 Notes
 -----
 
-This library is in its early stages of development. It is not feature-complete.
+This library is in its early stages of development.
 Large, backwards-incompatible changes may occur between revisions.
 
-Specifically, the following features are not supported by this implementation:
-reading BMP block data and writing OIR files.
+`Olympus/Evident <https://www.olympus-evident.com/>`_ is a manufacturer of
+microscopes and scientific instruments.
+Olympus Image Format Raw (OIR) files are proprietary formats written by
+Evident FluoView acquisition software to store microscopy images and metadata.
 
-The library has been tested with a limited number of files only.
+No public specification for the OIR file format exists. The format has been
+reverse-engineered from sample files.
 
-OIR is a proprietary binary file format used by Olympus/Evident FluoView
-software. Files begin with the magic bytes OLYMPUSRAWFORMAT followed by
+OIR files begin with the magic bytes OLYMPUSRAWFORMAT followed by
 a header pointing to a block index at the end of the file.
-The block index lists offsets to typed blocks: UID blocks paired with PIXEL
-blocks containing raw image planes, BMP blocks containing bitmap thumbnail
-images, FRAMEPROPERTIES blocks with per-frame XML describing dimensions and
-axis positions, METADATA blocks containing XML documents for file info,
-LSM image settings (channels, axes, pixel size, acquisition parameters),
-annotations, overlays, and LUTs.
-Image data is organized as up to 6 dimensions: T (timelapse),
+The block index lists offsets to typed blocks: UID blocks paired with
+PIXEL blocks (raw image planes), BMP blocks (bitmap thumbnails),
+FRAMEPROPERTIES blocks (per-frame XML with dimensions and axis positions),
+and METADATA blocks (XML documents for file info, LSM image settings,
+channels, axes, pixel size, acquisition parameters, annotations, overlays,
+and LUTs).
+Image data is organized as up to six dimensions: T (timelapse),
 L (lambda/spectral), Z (z-stack), C/S (channel or RGB sample), Y, and X.
 Each plane is stored as one or more PIXEL blocks identified by a structured
 UID encoding the plane's dimensional indices and channel GUID.
 POIR files are ZIP archives containing one or more OIR files.
 
-No public specification for the OIR file format exists. The format has been
-reverse-engineered from sample files.
+This library is not feature-complete. Unsupported features currently include
+reading BMP block data and writing OIR files.
+
+The library has been tested with only a limited number of files.
 
 Other implementations for reading OIR files are
 `Image5D <https://github.com/Silver-Fang/Image5D>`_ (C++) and
@@ -108,7 +117,7 @@ Other implementations for reading OIR files are
 Examples
 --------
 
-Read an image and metadata from a OIR file:
+Read an image and metadata from an OIR file:
 
 >>> with OirFile('tests/data/Test.oir') as oir:
 ...     xml_metadata = oir.xml_metadata
@@ -128,7 +137,7 @@ Attributes...
     channel_wavelengths:  {'CH1': (None, None), 'CH2': (500.0, 600.0),...
     datetime:             2020-12-23T14:44:50.939+13:00
 
-View the image and metadata in a OIR file from the console::
+View the image and metadata in an OIR file from the console::
 
     $ python -m oirfile tests/data/Test.oir
 
@@ -136,7 +145,7 @@ View the image and metadata in a OIR file from the console::
 
 from __future__ import annotations
 
-__version__ = '2026.3.8'
+__version__ = '2026.3.28'
 
 __all__ = [
     'FILE_EXTENSIONS',
@@ -160,7 +169,7 @@ import sys
 import types
 import zipfile
 from functools import cached_property
-from typing import TYPE_CHECKING, ClassVar, final, overload
+from typing import TYPE_CHECKING, ClassVar, final, overload, override
 from xml.etree import ElementTree
 
 if TYPE_CHECKING:
@@ -171,9 +180,9 @@ if TYPE_CHECKING:
     from numpy.typing import DTypeLike, NDArray
     from xarray import DataArray
 
-    OutputType = str | IO[bytes] | NDArray[Any] | None
-
 import numpy
+
+type OutputType = str | IO[bytes] | NDArray[Any] | None
 
 
 @overload
@@ -374,12 +383,12 @@ class BinaryFile:
 
     @property
     def filename(self) -> str:
-        """Name of file or empty if binary stream."""
+        """Name of file, or empty if no path is available."""
         return os.path.basename(self._path)
 
     @property
     def dirname(self) -> str:
-        """Directory containing file or empty if binary stream."""
+        """Directory containing file, or empty if no path is available."""
         return os.path.dirname(self._path)
 
     @property
@@ -480,6 +489,7 @@ class OirFile(BinaryFile):
     _pixel_length_y: float
     _xml_metadata: dict[METADATA, list[str]]
 
+    @override
     def __init__(
         self,
         file: str | os.PathLike[Any] | IO[bytes],
@@ -907,6 +917,17 @@ class OirFile(BinaryFile):
         sizes['Y'] = self._frame.height
         sizes['X'] = self._frame.width
 
+        # For concatenated scans (e.g. long line scans stored as one key),
+        # the actual Y extent may exceed the per-frame height stored in XML.
+        # Compute actual Y from total pixel data bytes across all blocks.
+        if self._frame.width > 0 and self._frame.depth > 0:
+            max_actual_height = max(
+                sum(length for _, length in blocks)
+                // (self._frame.width * self._frame.depth)
+                for blocks in self._pixel_map.values()
+            )
+            sizes['Y'] = max(sizes['Y'], max_actual_height)
+
         return sizes
 
     @property
@@ -995,8 +1016,8 @@ class OirFile(BinaryFile):
             result[chan_label] = numpy.array(names)
 
         if 'Y' in sizes:
-            if self._pixel_length_y > 0:
-                step = self._pixel_length_y / sizes['Y']
+            if self._pixel_length_y > 0 and self._frame.height > 0:
+                step = self._pixel_length_y / self._frame.height
                 result['Y'] = numpy.arange(sizes['Y']) * step
             else:
                 result['Y'] = numpy.arange(sizes['Y'], dtype=numpy.float64)
@@ -1026,6 +1047,7 @@ class OirFile(BinaryFile):
         ordered.extend(sorted(chan_ids))
         return ordered
 
+    @override
     @cached_property
     def attrs(self) -> dict[str, Any]:
         """Image metadata as dict."""
@@ -1151,10 +1173,11 @@ class OirFile(BinaryFile):
             plane_bytes = b''.join(chunks)
 
             plane_data = numpy.frombuffer(plane_bytes, dtype=self._frame.dtype)
-            expected = self._frame.height * self._frame.width
+            y_size = sizes.get('Y', self._frame.height)
+            expected = y_size * self._frame.width
             if len(plane_data) >= expected:
                 plane_data = plane_data[:expected].reshape(
-                    self._frame.height, self._frame.width
+                    y_size, self._frame.width
                 )
                 idx.extend([slice(None), slice(None)])
                 data[tuple(idx)] = plane_data
@@ -1190,6 +1213,7 @@ class OirFile(BinaryFile):
             f'path: {self._path}',
         )
 
+    @override
     def __repr__(self) -> str:
         dims = ', '.join(f'{k}: {v}' for k, v in self.sizes.items())
         return f'<OirFile {self._name!r} ({dims}) {self._frame.dtype}>'
@@ -1242,6 +1266,7 @@ class PoirFile(collections.abc.Mapping[str, OirFile]):
             if info.filename.lower().endswith('.oir')
         ]
 
+    @override
     def __getitem__(self, name: str) -> OirFile:
         if name not in self._cache:
             if name not in self._names:
@@ -1251,12 +1276,15 @@ class PoirFile(collections.abc.Mapping[str, OirFile]):
             self._cache[name] = OirFile(stream, squeeze=self._squeeze)
         return self._cache[name]
 
+    @override
     def __iter__(self) -> Iterator[str]:
         return iter(self._names)
 
+    @override
     def __len__(self) -> int:
         return len(self._names)
 
+    @override
     def __repr__(self) -> str:
         return f'<PoirFile ({len(self._names)} OIR files)>'
 
