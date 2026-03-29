@@ -4,13 +4,14 @@
 Read Olympus/Evident OIR and POIR files
 =======================================
 
-Oirfile is a Python library to read images and metadata from OIR files
-and POIR archives (ZIP collections of OIR files) produced by
-Olympus/Evident FluoView fluorescence microscopy software.
+Oirfile is a Python library to read images and metadata from OIR (Olympus
+Image Format Raw) files and POIR archives (ZIP collections of OIR files)
+produced by Olympus/Evident FluoView fluorescence microscopy software.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.3.8
+:Version: 2026.3.28
+:DOI: `10.5281/zenodo.18916509 <https://doi.org/10.5281/zenodo.18916509>`_
 
 Quickstart
 ----------
@@ -32,13 +33,17 @@ This revision was tested with the following requirements and dependencies
 (other versions may work):
 
 - `CPython <https://www.python.org>`_ 3.12.10, 3.13.12, 3.14.3 64-bit
-- `NumPy <https://pypi.org/project/numpy>`_ 2.4.2
+- `NumPy <https://pypi.org/project/numpy>`_ 2.4.3
 - `Xarray <https://pypi.org/project/xarray>`_ 2026.2.0 (recommended)
 - `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.10.8 (optional)
 - `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.3.3 (optional)
 
 Revisions
 ---------
+
+2026.3.28
+
+- Fix reading long line scan where Y exceeds per-frame height.
 
 2026.3.8
 
@@ -48,31 +53,35 @@ Revisions
 Notes
 -----
 
-This library is in its early stages of development. It is not feature-complete.
+This library is in its early stages of development.
 Large, backwards-incompatible changes may occur between revisions.
 
-Specifically, the following features are not supported by this implementation:
-reading BMP block data and writing OIR files.
+`Olympus/Evident <https://www.olympus-evident.com/>`_ is a manufacturer of
+microscopes and scientific instruments.
+Olympus Image Format Raw (OIR) files are proprietary formats written by
+Evident FluoView acquisition software to store microscopy images and metadata.
 
-The library has been tested with a limited number of files only.
+No public specification for the OIR file format exists. The format has been
+reverse-engineered from sample files.
 
-OIR is a proprietary binary file format used by Olympus/Evident FluoView
-software. Files begin with the magic bytes OLYMPUSRAWFORMAT followed by
+OIR files begin with the magic bytes OLYMPUSRAWFORMAT followed by
 a header pointing to a block index at the end of the file.
-The block index lists offsets to typed blocks: UID blocks paired with PIXEL
-blocks containing raw image planes, BMP blocks containing bitmap thumbnail
-images, FRAMEPROPERTIES blocks with per-frame XML describing dimensions and
-axis positions, METADATA blocks containing XML documents for file info,
-LSM image settings (channels, axes, pixel size, acquisition parameters),
-annotations, overlays, and LUTs.
-Image data is organized as up to 6 dimensions: T (timelapse),
+The block index lists offsets to typed blocks: UID blocks paired with
+PIXEL blocks (raw image planes), BMP blocks (bitmap thumbnails),
+FRAMEPROPERTIES blocks (per-frame XML with dimensions and axis positions),
+and METADATA blocks (XML documents for file info, LSM image settings,
+channels, axes, pixel size, acquisition parameters, annotations, overlays,
+and LUTs).
+Image data is organized as up to six dimensions: T (timelapse),
 L (lambda/spectral), Z (z-stack), C/S (channel or RGB sample), Y, and X.
 Each plane is stored as one or more PIXEL blocks identified by a structured
 UID encoding the plane's dimensional indices and channel GUID.
 POIR files are ZIP archives containing one or more OIR files.
 
-No public specification for the OIR file format exists. The format has been
-reverse-engineered from sample files.
+This library is not feature-complete. Unsupported features currently include
+reading BMP block data and writing OIR files.
+
+The library has been tested with only a limited number of files.
 
 Other implementations for reading OIR files are
 `Image5D <https://github.com/Silver-Fang/Image5D>`_ (C++) and
@@ -81,7 +90,7 @@ Other implementations for reading OIR files are
 Examples
 --------
 
-Read an image and metadata from a OIR file:
+Read an image and metadata from an OIR file:
 
 .. code-block:: python
 
@@ -103,6 +112,6 @@ Read an image and metadata from a OIR file:
         channel_wavelengths:  {'CH1': (None, None), 'CH2': (500.0, 600.0),...
         datetime:             2020-12-23T14:44:50.939+13:00
 
-View the image and metadata in a OIR file from the console::
+View the image and metadata in an OIR file from the console::
 
     $ python -m oirfile tests/data/Test.oir
