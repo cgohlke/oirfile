@@ -487,6 +487,14 @@ class OirFile(BinaryFile):
     ]  # axis_type -> {start, end, step, maxSize, enable}
     _pixel_length_x: float
     _pixel_length_y: float
+    _pixel_unit_x: str
+    _pixel_unit_y: str
+    _pixel_unit_z: str
+    _line_speed: float
+    _frame_speed: float
+    _line_coordinates: tuple[tuple[int, int], tuple[int, int]] | None
+    _ref_pixel_blocks: list[tuple[int, int]]
+    _bmp_blocks: list[tuple[int, int]]
     _xml_metadata: dict[METADATA, list[str]]
 
     @override
@@ -542,6 +550,7 @@ class OirFile(BinaryFile):
         uid_pixel_pairs: list[tuple[str, int, int]] = []
         frame_props_list: list[str] = []
         xml_metadata: dict[METADATA, list[str]] = {}
+        self._bmp_blocks = []
 
         i = 0
         while i < len(block_offsets):
@@ -561,6 +570,10 @@ class OirFile(BinaryFile):
                         uid_pixel_pairs.append((uid, next_off + 8, plen))
                         i += 2
                         continue
+                i += 1
+
+            elif btype == BLOCK.BMP:
+                self._bmp_blocks.append((off + 8, length))
                 i += 1
 
             elif btype == BLOCK.FRAMEPROPERTIES:
@@ -664,6 +677,8 @@ class OirFile(BinaryFile):
             return
 
         root = ElementTree.fromstring(frame_props[0])
+        # print('xxx abb')
+        # root = ElementTree.fromstring(frame_props[1])
 
         def _find_text(tag: str) -> str:
             for elem in root.iter():
@@ -706,6 +721,12 @@ class OirFile(BinaryFile):
         self._axis_info = {}
         self._pixel_length_x = 0.0
         self._pixel_length_y = 0.0
+        self._pixel_unit_x = ''
+        self._pixel_unit_y = ''
+        self._pixel_unit_z = ''
+        self._line_speed = 0.0
+        self._frame_speed = 0.0
+        self._line_coordinates = None
 
         xmls = self._xml_metadata.get(METADATA.LSMIMAGE)
         xml = xmls[0] if xmls else None
@@ -787,7 +808,7 @@ class OirFile(BinaryFile):
             if axis_type and info.get('enable', False):
                 self._axis_info[axis_type] = info
 
-        # extract pixel lengths
+        # extract pixel lengths and units
         for elem in root.iter():
             tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
             if tag == 'length':
@@ -803,15 +824,82 @@ class OirFile(BinaryFile):
                         self._pixel_length_y = float(child.text.strip())
                 break
 
+        for elem in root.iter():
+            tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+            if tag == 'pixelUnit':
+                for child in elem:
+                    ctag = (
+                        child.tag.split('}')[-1]
+                        if '}' in child.tag
+                        else child.tag
+                    )
+                    if ctag == 'x' and child.text:
+                        self._pixel_unit_x = child.text.strip()
+                    elif ctag == 'y' and child.text:
+                        self._pixel_unit_y = child.text.strip()
+                    elif ctag == 'z' and child.text:
+                        self._pixel_unit_z = child.text.strip()
+                break
+
+        # extract line ROI coordinates
+        for elem in root.iter():
+            tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+            if tag != 'coordinates':
+                continue
+            if {'x1', 'x2', 'y1', 'y2'} <= set(elem.attrib):
+                self._line_coordinates = (
+                    (
+                        int(round(float(elem.attrib['x1']))),
+                        int(round(float(elem.attrib['y1']))),
+                    ),
+                    (
+                        int(round(float(elem.attrib['x2']))),
+                        int(round(float(elem.attrib['y2']))),
+                    ),
+                )
+                break
+
+        # extract acquisition timing information
+        imageinfo = None
+        acquisition = None
+        for child in root:
+            ctag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if ctag == 'imageInfo':
+                imageinfo = child
+            elif ctag == 'acquisition':
+                acquisition = child
+
+        image_width = 0
+        if imageinfo is not None:
+            for child in imageinfo:
+                ctag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                if ctag == 'width' and child.text:
+                    image_width = int(child.text.strip())
+                    break
+
+        if acquisition is not None and image_width == self._frame.width:
+            for elem in acquisition.iter():
+                tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                if tag == 'lineSpeed' and elem.text and self._line_speed == 0.0:
+                    self._line_speed = float(elem.text.strip())
+                elif (
+                    tag == 'frameSpeed'
+                    and elem.text
+                    and self._frame_speed == 0.0
+                ):
+                    self._frame_speed = float(elem.text.strip())
+
     def _parse_uids(
         self,
         uid_pixel_pairs: list[tuple[str, int, int]],
     ) -> None:
         """Parse UIDs and build pixel data mapping."""
         self._pixel_map = {}
+        self._ref_pixel_blocks = []
 
         for uid, pixel_offset, pixel_length in uid_pixel_pairs:
             if uid.startswith('REF_'):
+                self._ref_pixel_blocks.append((pixel_offset, pixel_length))
                 continue
 
             match = UID_PATTERN.match(uid)
@@ -1031,6 +1119,266 @@ class OirFile(BinaryFile):
 
         return result
 
+    @staticmethod
+    def _normalize_unit_name(unit: str) -> str:
+        """Return normalized unit name."""
+        unit = unit.strip().upper()
+        if unit == 'MICRO_METER':
+            return 'um'
+        if unit == 'MILLI_SECOND':
+            return 'ms'
+        if unit == 'SECOND':
+            return 's'
+        return unit.lower() if unit else ''
+
+
+    @cached_property
+    def has_bmp(self) -> bool:
+        """Embedded BMP block data is present in file."""
+        return bool(self._bmp_blocks)
+
+    @cached_property
+    def bmp_count(self) -> int:
+        """Number of embedded BMP blocks in file."""
+        return len(self._bmp_blocks)
+
+    @cached_property
+    def bmp_shape(self) -> tuple[int, int] | None:
+        """Shape of first embedded BMP block as ``(height, width)``."""
+        if not self._bmp_blocks:
+            return None
+        offset, length = self._bmp_blocks[0]
+        if length < 30:
+            return None
+        fh = self._fh
+        fh.seek(offset)
+        header = fh.read(min(length, 68))
+        if len(header) < 30:
+            return None
+        bmp_offset = 4 if header.startswith(b'BMP ') else 0
+        header = header[bmp_offset:]
+        if len(header) < 26 or header[:2] != b'BM':
+            return None
+        dib_size = struct.unpack('<I', header[14:18])[0]
+        if dib_size < 40 or len(header) < 26:
+            return None
+        width = struct.unpack('<i', header[18:22])[0]
+        height = struct.unpack('<i', header[22:26])[0]
+        if width == 0 or height == 0:
+            return None
+        return (abs(height), abs(width))
+
+    def asbytes_bmp(self, index: int = 0) -> bytes:
+        """Return embedded BMP block as raw BMP bytes.
+
+        Parameters:
+            index:
+                Zero-based index of embedded BMP block to read.
+
+        Returns:
+            Raw BMP file bytes beginning with the ``BM`` signature.
+
+        Raises:
+            OirFileError: No BMP is present or index is out of range.
+
+        Notes:
+            OIR files may embed one or more BMP blocks, typically thumbnail
+            or preview images. This method returns the original BMP payload
+            without decoding or modifying it.
+
+        """
+        if not self._bmp_blocks:
+            raise OirFileError('embedded BMP not found')
+        try:
+            offset, length = self._bmp_blocks[index]
+        except IndexError as exc:
+            raise OirFileError('embedded BMP index out of range') from exc
+        fh = self._fh
+        fh.seek(offset)
+        data = fh.read(length)
+        if len(data) != length:
+            raise OirFileError('invalid embedded BMP data')
+        if data.startswith(b'BMP '):
+            data = data[4:]
+        if not data.startswith(b'BM'):
+            raise OirFileError('invalid embedded BMP data')
+        return data
+
+    @cached_property
+    def has_reference(self) -> bool:
+        """Reference image data is present in file."""
+        return bool(self._ref_pixel_blocks)
+
+    @cached_property
+    def reference_shape(self) -> tuple[int, ...] | None:
+        """Shape of reference image, if present."""
+        if not self._ref_pixel_blocks:
+            return None
+        nbytes = sum(length for _, length in self._ref_pixel_blocks)
+        if nbytes % self._frame.dtype.itemsize != 0:
+            return None
+        size = nbytes // self._frame.dtype.itemsize
+        side = int(numpy.sqrt(size))
+        if side * side == size:
+            return side, side
+        return None
+
+    @cached_property
+    def line_coordinates(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """Line ROI coordinates in reference-image pixel coordinates."""
+        return self._line_coordinates
+
+    @cached_property
+    def axis_kinds(self) -> dict[str, str]:
+        """Semantic kind of each array dimension."""
+        result: dict[str, str] = {}
+        for dim in self.dims:
+            if dim in {'X', 'Z'}:
+                result[dim] = 'space'
+            elif dim == 'Y':
+                result[dim] = 'time' if self.is_linescan else 'space'
+            elif dim == 'T':
+                result[dim] = 'time'
+            elif dim == 'L':
+                result[dim] = 'wavelength'
+            elif dim in {'C', 'S'}:
+                result[dim] = 'channel'
+            else:
+                result[dim] = 'index'
+        return result
+
+    @cached_property
+    def axis_units(self) -> dict[str, str]:
+        """Unit string for each array dimension."""
+        result: dict[str, str] = {}
+        xunit = self._normalize_unit_name(self._pixel_unit_x)
+        yunit = self._normalize_unit_name(self._pixel_unit_y)
+        zunit = self._normalize_unit_name(self._pixel_unit_z)
+        for dim in self.dims:
+            if dim == 'X':
+                result[dim] = xunit or 'px'
+            elif dim == 'Y':
+                if self.is_linescan and self._line_speed > 0.0:
+                    result[dim] = 'ms'
+                else:
+                    result[dim] = yunit or 'px'
+            elif dim == 'Z':
+                result[dim] = zunit or yunit or xunit or 'px'
+            elif dim == 'T':
+                result[dim] = 's'
+            elif dim == 'L':
+                result[dim] = 'nm'
+            elif dim in {'C', 'S'}:
+                result[dim] = ''
+            else:
+                result[dim] = ''
+        return result
+
+    @cached_property
+    def reference_axis_units(self) -> dict[str, str]:
+        """Unit string for reference-image dimensions."""
+        if not self.has_reference:
+            return {}
+        unit = self._normalize_unit_name(self._pixel_unit_y or self._pixel_unit_x)
+        return {'Y': unit or 'px', 'X': self._normalize_unit_name(self._pixel_unit_x) or unit or 'px'}
+
+
+    @cached_property
+    def reference_pixel_size(self) -> tuple[float, float] | None:
+        """Reference-image pixel spacing for ``Y`` and ``X`` dimensions.
+
+        Returns:
+            Tuple ``(dy, dx)`` in the units reported by
+            :py:attr:`reference_axis_units`, or ``None`` if unavailable.
+
+        Notes:
+            For the uploaded Olympus line-scan OIR samples, the values come
+            from ``commonphase:length`` in LSMIMAGE metadata and correspond to
+            the per-pixel spatial calibration of the extracted reference image.
+
+        """
+        if not self.has_reference:
+            return None
+        dx = self._pixel_length_x
+        dy = self._pixel_length_y
+        if dx <= 0.0 and dy <= 0.0:
+            return None
+        if dy <= 0.0:
+            dy = dx
+        if dx <= 0.0:
+            dx = dy
+        return (dy, dx)
+
+    @cached_property
+    def line_coordinates_physical(
+        self,
+    ) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """Line ROI coordinates in reference-image physical units.
+
+        Returns:
+            Two endpoint tuples in ``((x0, y0), (x1, y1))`` order, matching
+            :py:attr:`line_coordinates`, with each coordinate converted from
+            pixels to the physical units reported by
+            :py:attr:`reference_axis_units`.
+
+        """
+        if self._line_coordinates is None:
+            return None
+        spacing = self.reference_pixel_size
+        if spacing is None:
+            return None
+        dy, dx = spacing
+        (x0, y0), (x1, y1) = self._line_coordinates
+        return ((x0 * dx, y0 * dy), (x1 * dx, y1 * dy))
+
+    @cached_property
+    def is_linescan(self) -> bool:
+        """Image is a line scan represented as Y,X array."""
+        return (
+            self.dims == ('Y', 'X')
+            and 'TIMELAPSE' in self._axis_info
+            and self._line_coordinates is not None
+        )
+
+    def asarray_reference(self, *, out: OutputType = None) -> NDArray[Any]:
+        """Return reference image as NumPy array.
+
+        Parameters:
+            out:
+                Output destination for image data.
+                If ``None``, create a new NumPy array in main memory.
+                If ``'memmap'``, create a memory-mapped array in a
+                temporary file.
+                If a ``numpy.ndarray``, a writable, initialized array
+                of :py:attr:`reference_shape` and :py:attr:`dtype`.
+                If a ``file name`` or ``open file``, create a
+                memory-mapped array in the specified file.
+
+        Returns:
+            NumPy array containing reference image data.
+
+        Raises:
+            OirFileError: No reference image data or unsupported layout.
+
+        """
+        shape = self.reference_shape
+        if shape is None:
+            raise OirFileError('reference image not found or unsupported')
+
+        data = create_output(
+            out, shape=shape, dtype=self._frame.dtype, fillvalue=0
+        )
+        chunks = []
+        fh = self._fh
+        for offset, length in self._ref_pixel_blocks:
+            fh.seek(offset)
+            chunks.append(fh.read(length))
+        ref = numpy.frombuffer(b''.join(chunks), dtype=self._frame.dtype)
+        if ref.size != int(numpy.prod(shape)):
+            raise OirFileError('reference image has unexpected size')
+        data[...] = ref.reshape(shape)
+        return data
+
     def _get_ordered_channel_guids(self) -> list[str]:
         """Return channel GUIDs in order from pixel map."""
         chan_ids: set[str] = set()
@@ -1055,6 +1403,10 @@ class OirFile(BinaryFile):
             'filepath': self._path,
             'bitspersample': self._frame.bitspersample,
             'colortype': self._frame.colortype,
+            'has_reference': self.has_reference,
+            'has_bmp': self.has_bmp,
+            'bmp_count': self.bmp_count,
+            'bmp_shape': self.bmp_shape,
         }
 
         if self._channels:
