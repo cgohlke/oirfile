@@ -37,7 +37,7 @@ DATA = Path(__file__).resolve().parent / 'data'
         ),
     ],
 )
-def test_reference_api(
+def test_reference_api_linescan_files(
     filename: str,
     shape: tuple[int, int],
     line_coordinates: tuple[tuple[int, int], tuple[int, int]],
@@ -102,6 +102,33 @@ def test_main_asarray_is_unchanged() -> None:
         assert data.dtype == numpy.dtype('uint16')
         assert int(data.min()) >= 0
         assert int(data.max()) > int(data.min())
+
+
+def test_reference_api_timeseries_image_without_line_roi() -> None:
+    """Reference image and axis metadata are exposed without a line ROI."""
+    with OirFile(DATA / '20190416_b_0001.oir') as oir:
+        assert oir.shape == (2, 512, 512)
+        assert oir.dims == ('T', 'Y', 'X')
+
+        assert oir.axis_kinds == {'T': 'time', 'Y': 'space', 'X': 'space'}
+        assert oir.axis_units == {'T': 's', 'Y': 'um', 'X': 'um'}
+
+        assert oir.has_reference is True
+        assert oir.reference_shape == (512, 512)
+
+        ref = oir.asarray_reference()
+        assert ref.shape == (512, 512)
+        assert ref.dtype == numpy.dtype('uint16')
+        assert int(ref.min()) >= 0
+        assert int(ref.max()) > int(ref.min())
+
+        assert oir.line_coordinates is None
+        assert oir.line_coordinates_physical is None
+
+        assert oir.reference_axis_units == {'Y': 'um', 'X': 'um'}
+        assert oir.reference_pixel_size == pytest.approx(
+            (0.497184455521791, 0.497184455521791)
+        )
 
 
 def test_embedded_bmp_bytes() -> None:
