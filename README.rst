@@ -10,7 +10,7 @@ produced by Olympus/Evident FluoView fluorescence microscopy software.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.3.28
+:Version: 2026.4.18
 :DOI: `10.5281/zenodo.18916509 <https://doi.org/10.5281/zenodo.18916509>`_
 
 Quickstart
@@ -32,14 +32,24 @@ Requirements
 This revision was tested with the following requirements and dependencies
 (other versions may work):
 
-- `CPython <https://www.python.org>`_ 3.12.10, 3.13.12, 3.14.3 64-bit
-- `NumPy <https://pypi.org/project/numpy>`_ 2.4.3
-- `Xarray <https://pypi.org/project/xarray>`_ 2026.2.0 (recommended)
+- `CPython <https://www.python.org>`_ 3.12.10, 3.13.13, 3.14.4 64-bit
+- `NumPy <https://pypi.org/project/numpy>`_ 2.4.4
+- `Xarray <https://pypi.org/project/xarray>`_ 2026.4.0 (recommended)
 - `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.10.8 (optional)
-- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.3.3 (optional)
+- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.4.11 (optional)
 
 Revisions
 ---------
+
+2026.4.18
+
+- Omit axes from coords when no meaningful metadata is available (breaking).
+- Add OirReference class for reference images and their line ROI coordinates.
+- Add thumbnail and reference properties to OirFile (#3).
+- Add coord_offsets and coord_scales properties to OirFile.
+- Add bitspersample and colortype properties to OirFile.
+- Normalize colortype "GlayScale" to "GrayScale".
+- Use per-frame positions for lambda (L) axis coordinates.
 
 2026.3.28
 
@@ -66,20 +76,20 @@ reverse-engineered from sample files.
 
 OIR files begin with the magic bytes OLYMPUSRAWFORMAT followed by
 a header pointing to a block index at the end of the file.
-The block index lists offsets to typed blocks: UID blocks paired with
-PIXEL blocks (raw image planes), BMP blocks (bitmap thumbnails),
+The block index lists offsets to typed blocks:
+UID blocks paired with PIXEL blocks (raw image planes or reference images),
 FRAMEPROPERTIES blocks (per-frame XML with dimensions and axis positions),
-and METADATA blocks (XML documents for file info, LSM image settings,
-channels, axes, pixel size, acquisition parameters, annotations, overlays,
-and LUTs).
+METADATA blocks (XML documents for file info, LSM image settings, channels,
+axes, pixel size, acquisition parameters, annotations, overlays, and LUTs),
+and BMP blocks (bitmap thumbnails).
 Image data is organized as up to six dimensions: T (timelapse),
 L (lambda/spectral), Z (z-stack), C/S (channel or RGB sample), Y, and X.
 Each plane is stored as one or more PIXEL blocks identified by a structured
 UID encoding the plane's dimensional indices and channel GUID.
 POIR files are ZIP archives containing one or more OIR files.
 
-This library is not feature-complete. Unsupported features currently include
-reading BMP block data and writing OIR files.
+This library is not feature-complete. Writing OIR files, compressed pixel
+data, and mosaic acquisitions are not supported.
 
 The library has been tested with only a limited number of files.
 
@@ -108,7 +118,7 @@ Read an image and metadata from an OIR file:
       * X        (X) float64 5kB 0.0 0.003884... 2.482
     Attributes...
         bitspersample:        12
-        colortype:            GlayScale
+        colortype:            GrayScale
         channel_wavelengths:  {'CH1': (None, None), 'CH2': (500.0, 600.0),...
         datetime:             2020-12-23T14:44:50.939+13:00
 
