@@ -29,7 +29,7 @@
 
 """Unittests for the oirfile package.
 
-:Version: 2026.3.28
+:Version: 2026.4.18
 
 """
 
@@ -323,7 +323,7 @@ def test_oir():
         # attrs
         attrs = oir.attrs
         assert attrs['bitspersample'] == 16
-        assert attrs['colortype'] == 'GlayScale'
+        assert attrs['colortype'] == 'GrayScale'
         assert attrs['datetime'] == '2024-12-02T09:52:10.944+08:00'
         assert attrs['channel_wavelengths']['CH2'] == (500.0, 540.0)
         assert attrs['channel_wavelengths']['CH3'] == (570.0, 620.0)
@@ -379,6 +379,79 @@ def test_oir():
         assert list(xa.coords['C'].values) == ['CH2', 'CH3']
         assert xa.name.endswith('30sec_sequence_frame_z stack.oir')
 
+        # bitspersample and colortype properties
+        assert oir.bitspersample == 16
+        assert oir.colortype == 'GrayScale'
+
+        # coord_units
+        coord_units = oir.coord_units
+        assert coord_units == {
+            'T': 's',
+            'Z': 'µm',
+            'Y': 'µm',
+            'X': 'µm',
+        }
+
+        # coord_offsets
+        coord_offsets = oir.coord_offsets
+        assert 'T' in coord_offsets
+        assert coord_offsets['T'] == 0.0
+        assert coord_offsets['Z'] == pytest.approx(4876.4, rel=0.01)
+        assert coord_offsets['Y'] == 0.0
+        assert coord_offsets['X'] == 0.0
+
+        # coord_scales
+        coord_scales = oir.coord_scales
+        assert coord_scales['T'] == pytest.approx(2249.024, rel=0.01)
+        assert coord_scales['Z'] == pytest.approx(3.93, rel=0.01)
+        assert 'Y' in coord_scales
+        assert 'X' in coord_scales
+
+        # thumbnail
+        thumb = oir.thumbnail
+        assert isinstance(thumb, bytes)
+        assert len(thumb) > 0
+        assert thumb[:2] == b'BM'  # BMP header
+
+        # reference
+        ref = oir.reference
+        assert ref is not None
+        assert ref.sizes == {'C': 2, 'Y': 512, 'X': 512}
+        assert ref.shape == (2, 512, 512)
+        assert ref.dims == ('C', 'Y', 'X')
+        assert ref.ndim == 3
+        assert ref.size == 2 * 512 * 512
+        assert ref.nbytes == ref.size * ref.dtype.itemsize
+        assert ref.dtype == numpy.dtype('<u2')
+        assert ref.line_roi is None
+        ref_attrs = ref.attrs
+        assert isinstance(ref_attrs, dict)
+        assert 'line_roi' not in ref_attrs
+        ref_coords = ref.coords
+        assert 'C' in ref_coords
+        assert 'Y' in ref_coords
+        assert 'X' in ref_coords
+        assert len(ref_coords['C']) == 2
+        assert len(ref_coords['Y']) == 512
+        assert len(ref_coords['X']) == 512
+        ref_units = ref.coord_units
+        assert ref_units == {'Y': 'µm', 'X': 'µm'}
+        ref_offsets = ref.coord_offsets
+        assert ref_offsets == {'Y': 0.0, 'X': 0.0}
+        ref_scales = ref.coord_scales
+        assert 'Y' in ref_scales
+        assert 'X' in ref_scales
+        ref_data = ref.asarray()
+        assert ref_data.shape == ref.shape
+        assert ref_data.dtype == ref.dtype
+        ref_xa = ref.asxarray()
+        assert isinstance(ref_xa, DataArray)
+        assert ref_xa.shape == ref.shape
+        assert ref_xa.dims == ref.dims
+        assert ref_xa.name == 'reference'
+        assert repr(ref) == '<OirReference (C: 2, Y: 512, X: 512) uint16>'
+        assert str(ref).startswith(repr(ref))
+
         # repr / str
         r = repr(oir)
         assert r == (
@@ -416,6 +489,156 @@ def test_oir_asarray_out(out, tmp_path):
         assert data.dtype == dtype
         assert numpy.array_equal(data, expected)
         del data  # ensure memmap file can be deleted
+
+
+def test_oir_line_roi():
+    """Test OirReference with line_roi coordinates."""
+    fname = DATA / 'arvink1' / 'Fiber_000.oir'
+    if not fname.exists():
+        pytest.skip(f'{fname!r} not found')
+    with OirFile(fname) as oir:
+        ref = oir.reference
+        assert ref is not None
+        assert ref.sizes == {'Y': 2048, 'X': 2048}
+        assert ref.shape == (2048, 2048)
+        assert ref.dims == ('Y', 'X')
+        assert ref.ndim == 2
+        assert ref.dtype == numpy.dtype('<u2')
+        # line_roi
+        roi = ref.line_roi
+        assert roi is not None
+        assert len(roi) == 4
+        assert roi == (369.0, 920.0, 324.0, 977.0)
+        # attrs includes line_roi
+        assert ref.attrs['line_roi'] == roi
+        # str includes line_roi
+        assert 'line_roi' in str(ref)
+        # asarray
+        data = ref.asarray()
+        assert data.shape == ref.shape
+        assert data.dtype == ref.dtype
+
+
+def test_oir_thumbnail_only():
+    """Test OirFile with thumbnail but no reference image."""
+    fname = DATA / 'Caged Glu-3 point.oir'
+    if not fname.exists():
+        pytest.skip(f'{fname!r} not found')
+    with OirFile(fname) as oir:
+        assert oir.reference is None
+        thumb = oir.thumbnail
+        assert isinstance(thumb, bytes)
+        assert len(thumb) > 0
+        assert thumb[:2] == b'BM'
+
+
+def test_oir_no_thumbnail_no_reference():
+    """Test OirFile with neither thumbnail nor reference image."""
+    fname = DATA / 'zenodo-13680725' / 'Map_A01.oir'
+    if not fname.exists():
+        pytest.skip(f'{fname!r} not found')
+    with OirFile(fname) as oir:
+        assert oir.thumbnail is None
+        assert oir.reference is None
+        assert oir.bitspersample == 16
+        assert oir.colortype == 'GrayScale'
+
+
+def test_oir_camera_rgb_reference():
+    """Test OirFile with RGB reference and colortype."""
+    fname = DATA / '220117_1058_195_COLOR3D^XY_Camera.oir'
+    if not fname.exists():
+        pytest.skip(f'{fname!r} not found')
+    with OirFile(fname) as oir:
+        assert oir.colortype == 'RGB'
+        assert oir.bitspersample == 8
+        ref = oir.reference
+        assert ref is not None
+        assert ref.shape == (3, 976, 1024)
+        assert ref.dtype == numpy.dtype('uint8')
+        thumb = oir.thumbnail
+        assert isinstance(thumb, bytes)
+        assert thumb[:2] == b'BM'
+
+
+def test_oir_empty_colortype():
+    """Test OirFile with empty colortype string."""
+    fname = DATA / 'Caged Glu-3 point.oir'
+    if not fname.exists():
+        pytest.skip(f'{fname!r} not found')
+    with OirFile(fname) as oir:
+        assert oir.colortype == ''
+
+
+def test_oir_issues3_reference():
+    """Test reference image from issues3 time-series file."""
+    fname = DATA / 'issues3' / '20190416_b_0001.oir'
+    if not fname.exists():
+        pytest.skip(f'{fname!r} not found')
+    with OirFile(fname) as oir:
+        assert oir.sizes == {'T': 2, 'Y': 512, 'X': 512}
+        assert oir.bitspersample == 12
+        assert oir.colortype == 'GrayScale'
+        # thumbnail
+        thumb = oir.thumbnail
+        assert isinstance(thumb, bytes)
+        assert thumb[:2] == b'BM'
+        # reference (single-channel, no line_roi)
+        ref = oir.reference
+        assert ref is not None
+        assert ref.sizes == {'Y': 512, 'X': 512}
+        assert ref.shape == (512, 512)
+        assert ref.ndim == 2
+        assert ref.dtype == numpy.dtype('<u2')
+        assert ref.line_roi is None
+        data = ref.asarray()
+        assert data.shape == (512, 512)
+        assert data.dtype == ref.dtype
+        # coord_scales / coord_offsets
+        assert oir.coord_offsets['T'] == pytest.approx(0.0)
+        assert oir.coord_scales['T'] == pytest.approx(1086.534)
+        assert oir.coord_units['T'] == 's'
+
+
+def test_oir_issues3_line_scan():
+    """Test line scan with line_roi from issues3."""
+    fname = DATA / 'issues3' / '20251030_A106_0002.oir'
+    if not fname.exists():
+        pytest.skip(f'{fname!r} not found')
+    with OirFile(fname) as oir:
+        assert oir.sizes == {'Y': 30000, 'X': 24}
+        assert oir.bitspersample == 12
+        # reference with line_roi
+        ref = oir.reference
+        assert ref is not None
+        assert ref.sizes == {'Y': 512, 'X': 512}
+        assert ref.shape == (512, 512)
+        roi = ref.line_roi
+        assert roi == (250.0, 236.0, 244.0, 214.0)
+        assert ref.attrs['line_roi'] == roi
+        data = ref.asarray()
+        assert data.shape == ref.shape
+        assert data.dtype == ref.dtype
+
+
+@pytest.mark.parametrize(
+    ('fname', 'roi'),
+    [
+        ('20251030_A106_0003.oir', (248.0, 248.0, 229.0, 239.0)),
+        ('20251030_A106_0004.oir', (214.0, 194.0, 218.0, 175.0)),
+    ],
+)
+def test_oir_issues3_line_roi(fname, roi):
+    """Test line_roi values for issues3 line scan files."""
+    path = DATA / 'issues3' / fname
+    if not path.exists():
+        pytest.skip(f'{path!r} not found')
+    with OirFile(path) as oir:
+        ref = oir.reference
+        assert ref is not None
+        assert ref.line_roi == roi
+        assert ref.sizes == {'Y': 512, 'X': 512}
+        assert 'line_roi' in str(ref)
 
 
 def test_oir_camera_rgb():
