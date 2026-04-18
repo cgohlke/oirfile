@@ -37,7 +37,7 @@ produced by Olympus/Evident FluoView fluorescence microscopy software.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.3.28
+:Version: 2026.4.18
 :DOI: `10.5281/zenodo.18916509 <https://doi.org/10.5281/zenodo.18916509>`_
 
 Quickstart
@@ -59,14 +59,24 @@ Requirements
 This revision was tested with the following requirements and dependencies
 (other versions may work):
 
-- `CPython <https://www.python.org>`_ 3.12.10, 3.13.12, 3.14.3 64-bit
-- `NumPy <https://pypi.org/project/numpy>`_ 2.4.3
-- `Xarray <https://pypi.org/project/xarray>`_ 2026.2.0 (recommended)
+- `CPython <https://www.python.org>`_ 3.12.10, 3.13.13, 3.14.4 64-bit
+- `NumPy <https://pypi.org/project/numpy>`_ 2.4.4
+- `Xarray <https://pypi.org/project/xarray>`_ 2026.4.0 (recommended)
 - `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.10.8 (optional)
-- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.3.3 (optional)
+- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.4.11 (optional)
 
 Revisions
 ---------
+
+2026.4.18
+
+- Omit axes from coords when no meaningful metadata is available (breaking).
+- Add OirReference class for reference images and their line ROI coordinates.
+- Add thumbnail and reference properties to OirFile (#3).
+- Add coord_offsets and coord_scales properties to OirFile.
+- Add bitspersample and colortype properties to OirFile.
+- Normalize colortype "GlayScale" to "GrayScale".
+- Use per-frame positions for lambda (L) axis coordinates.
 
 2026.3.28
 
@@ -93,20 +103,20 @@ reverse-engineered from sample files.
 
 OIR files begin with the magic bytes OLYMPUSRAWFORMAT followed by
 a header pointing to a block index at the end of the file.
-The block index lists offsets to typed blocks: UID blocks paired with
-PIXEL blocks (raw image planes), BMP blocks (bitmap thumbnails),
+The block index lists offsets to typed blocks:
+UID blocks paired with PIXEL blocks (raw image planes or reference images),
 FRAMEPROPERTIES blocks (per-frame XML with dimensions and axis positions),
-and METADATA blocks (XML documents for file info, LSM image settings,
-channels, axes, pixel size, acquisition parameters, annotations, overlays,
-and LUTs).
+METADATA blocks (XML documents for file info, LSM image settings, channels,
+axes, pixel size, acquisition parameters, annotations, overlays, and LUTs),
+and BMP blocks (bitmap thumbnails).
 Image data is organized as up to six dimensions: T (timelapse),
 L (lambda/spectral), Z (z-stack), C/S (channel or RGB sample), Y, and X.
 Each plane is stored as one or more PIXEL blocks identified by a structured
 UID encoding the plane's dimensional indices and channel GUID.
 POIR files are ZIP archives containing one or more OIR files.
 
-This library is not feature-complete. Unsupported features currently include
-reading BMP block data and writing OIR files.
+This library is not feature-complete. Writing OIR files, compressed pixel
+data, and mosaic acquisitions are not supported.
 
 The library has been tested with only a limited number of files.
 
@@ -133,7 +143,7 @@ Coordinates:
   * X        (X) float64 5kB 0.0 0.003884... 2.482
 Attributes...
     bitspersample:        12
-    colortype:            GlayScale
+    colortype:            GrayScale
     channel_wavelengths:  {'CH1': (None, None), 'CH2': (500.0, 600.0),...
     datetime:             2020-12-23T14:44:50.939+13:00
 
@@ -145,13 +155,15 @@ View the image and metadata in an OIR file from the console::
 
 from __future__ import annotations
 
-__version__ = '2026.3.28'
+__version__ = '2026.4.18'
 
 __all__ = [
     'FILE_EXTENSIONS',
     'METADATA',
+    'OirChannel',
     'OirFile',
     'OirFileError',
+    'OirReference',
     'PoirFile',
     '__version__',
     'imread',
@@ -162,6 +174,7 @@ import contextlib
 import dataclasses
 import enum
 import io
+import math
 import os
 import re
 import struct
@@ -481,6 +494,11 @@ class OirFile(BinaryFile):
     _pixel_map: dict[
         tuple[int, int, int, str], list[tuple[int, int]]
     ]  # (t, l, z, chan) -> [(offset, length), ...]
+    _ref_pixel_map: dict[
+        str, list[tuple[int, int]]
+    ]  # chan_guid -> [(offset, length), ...]
+    _bmp_block: tuple[int, int] | None  # (offset, length) or None
+    _line_roi: tuple[float, float, float, float] | None
     _frame_positions: dict[str, list[float]]  # axis_type -> [position, ...]
     _axis_info: dict[
         str, dict[str, Any]
@@ -542,6 +560,7 @@ class OirFile(BinaryFile):
         uid_pixel_pairs: list[tuple[str, int, int]] = []
         frame_props_list: list[str] = []
         xml_metadata: dict[METADATA, list[str]] = {}
+        self._bmp_block = None
 
         i = 0
         while i < len(block_offsets):
@@ -629,6 +648,10 @@ class OirFile(BinaryFile):
                     start = pos + 5
                 i += 1
 
+            elif btype == BLOCK.BMP:
+                self._bmp_block = (off + 8, length)
+                i += 1
+
             else:
                 i += 1
 
@@ -706,6 +729,7 @@ class OirFile(BinaryFile):
         self._axis_info = {}
         self._pixel_length_x = 0.0
         self._pixel_length_y = 0.0
+        self._line_roi = None
 
         xmls = self._xml_metadata.get(METADATA.LSMIMAGE)
         xml = xmls[0] if xmls else None
@@ -803,15 +827,49 @@ class OirFile(BinaryFile):
                         self._pixel_length_y = float(child.text.strip())
                 break
 
+        # extract line ROI coordinates from region definitions
+        self._line_roi = None
+        for elem in root.iter():
+            tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+            if tag == 'coordinates':
+                x1 = elem.get('x1')
+                y1 = elem.get('y1')
+                x2 = elem.get('x2')
+                y2 = elem.get('y2')
+                if (
+                    x1 is not None
+                    and y1 is not None
+                    and x2 is not None
+                    and y2 is not None
+                ):
+                    self._line_roi = (
+                        float(x1),
+                        float(y1),
+                        float(x2),
+                        float(y2),
+                    )
+                    break
+
     def _parse_uids(
         self,
         uid_pixel_pairs: list[tuple[str, int, int]],
     ) -> None:
         """Parse UIDs and build pixel data mapping."""
         self._pixel_map = {}
+        self._ref_pixel_map = {}
 
         for uid, pixel_offset, pixel_length in uid_pixel_pairs:
             if uid.startswith('REF_'):
+                # REF_LSM0_<guid>_<block>
+                parts = uid.split('_')
+                if len(parts) >= 4:
+                    # guid is parts[2:-1] joined (guid contains dashes)
+                    guid = '_'.join(parts[2:-1])
+                    if guid not in self._ref_pixel_map:
+                        self._ref_pixel_map[guid] = []
+                    self._ref_pixel_map[guid].append(
+                        (pixel_offset, pixel_length)
+                    )
                 continue
 
             match = UID_PATTERN.match(uid)
@@ -865,6 +923,17 @@ class OirFile(BinaryFile):
     def dtype(self) -> numpy.dtype[Any]:
         """NumPy data type of image."""
         return self._frame.dtype
+
+    @property
+    def bitspersample(self) -> int:
+        """Number of significant bits per sample."""
+        return self._frame.bitspersample
+
+    @property
+    def colortype(self) -> str:
+        """Color type string, for example ``'GrayScale'`` or ``'RGB'``."""
+        ct = self._frame.colortype
+        return 'GrayScale' if ct == 'GlayScale' else ct
 
     @cached_property
     def sizes(self) -> dict[str, int]:
@@ -985,13 +1054,24 @@ class OirFile(BinaryFile):
                 info = self._axis_info.get('TIMELAPSE', {})
                 start = info.get('start', 0.0)
                 step = info.get('step', 1.0)
-                result['T'] = numpy.arange(sizes['T']) * step + start
+                if start != 0.0 or step != 1.0:
+                    result['T'] = numpy.linspace(
+                        start, start + (sizes['T'] - 1) * step, sizes['T']
+                    )
 
         if 'L' in sizes:
-            info = self._axis_info.get('LAMBDA', {})
-            start = info.get('start', 0.0)
-            step = info.get('step', 1.0)
-            result['L'] = numpy.arange(sizes['L']) * step + start
+            positions = self._frame_positions.get('LAMBDA')
+            if positions:
+                l_coords = sorted(set(positions))
+                result['L'] = numpy.array(l_coords[: sizes['L']])
+            else:
+                info = self._axis_info.get('LAMBDA', {})
+                start = info.get('start', 0.0)
+                step = info.get('step', 1.0)
+                if start != 0.0 or step != 1.0:
+                    result['L'] = numpy.linspace(
+                        start, start + (sizes['L'] - 1) * step, sizes['L']
+                    )
 
         if 'Z' in sizes:
             positions = self._frame_positions.get('ZSTACK')
@@ -1004,7 +1084,10 @@ class OirFile(BinaryFile):
                 info = self._axis_info.get('ZSTACK', {})
                 start = info.get('start', 0.0)
                 step = info.get('step', 1.0)
-                result['Z'] = numpy.arange(sizes['Z']) * step + start
+                if start != 0.0 or step != 1.0:
+                    result['Z'] = numpy.linspace(
+                        start, start + (sizes['Z'] - 1) * step, sizes['Z']
+                    )
 
         chan_label = 'C' if 'C' in sizes else 'S' if 'S' in sizes else ''
         if chan_label:
@@ -1015,21 +1098,195 @@ class OirFile(BinaryFile):
                 names.append(ch.name if ch else guid)
             result[chan_label] = numpy.array(names)
 
-        if 'Y' in sizes:
-            if self._pixel_length_y > 0 and self._frame.height > 0:
-                step = self._pixel_length_y / self._frame.height
-                result['Y'] = numpy.arange(sizes['Y']) * step
-            else:
-                result['Y'] = numpy.arange(sizes['Y'], dtype=numpy.float64)
+        if (
+            'Y' in sizes
+            and self._pixel_length_y > 0
+            and self._frame.height > 0
+        ):
+            step = self._pixel_length_y / self._frame.height
+            result['Y'] = numpy.linspace(
+                0.0, (sizes['Y'] - 1) * step, sizes['Y']
+            )
 
-        if 'X' in sizes:
-            if self._pixel_length_x > 0:
-                step = self._pixel_length_x / sizes['X']
-                result['X'] = numpy.arange(sizes['X']) * step
-            else:
-                result['X'] = numpy.arange(sizes['X'], dtype=numpy.float64)
+        if 'X' in sizes and self._pixel_length_x > 0:
+            step = self._pixel_length_x / sizes['X']
+            result['X'] = numpy.linspace(
+                0.0, (sizes['X'] - 1) * step, sizes['X']
+            )
 
         return result
+
+    @cached_property
+    def coord_units(self) -> dict[str, str]:
+        """Coordinate unit strings per axis.
+
+        Map dimension character codes to their unit string.
+        Only axes with numeric coordinates are included.
+
+        """
+        units: dict[str, str] = {}
+        sizes = self.sizes
+        if 'T' in sizes:
+            units['T'] = 's'
+        if 'L' in sizes:
+            units['L'] = 'nm'
+        if 'Z' in sizes:
+            units['Z'] = 'µm'
+        if 'Y' in sizes and self._pixel_length_y > 0:
+            units['Y'] = 'µm'
+        if 'X' in sizes and self._pixel_length_x > 0:
+            units['X'] = 'µm'
+        return units
+
+    @cached_property
+    def coord_offsets(self) -> dict[str, float]:
+        """Coordinate offsets (first pixel position) per axis.
+
+        Map dimension character codes to the coordinate value of the
+        first pixel. Only axes with numeric coordinates are included.
+
+        """
+        result: dict[str, float] = {}
+        sizes = self.sizes
+        if 'T' in sizes:
+            positions = self._frame_positions.get('TIMELAPSE')
+            if positions:
+                result['T'] = float(min(set(positions)))
+            else:
+                info = self._axis_info.get('TIMELAPSE', {})
+                start = info.get('start', 0.0)
+                if start != 0.0:
+                    result['T'] = start
+        if 'L' in sizes:
+            positions = self._frame_positions.get('LAMBDA')
+            if positions:
+                result['L'] = float(min(set(positions)))
+            else:
+                info = self._axis_info.get('LAMBDA', {})
+                start = info.get('start', 0.0)
+                if start != 0.0:
+                    result['L'] = start
+        if 'Z' in sizes:
+            positions = self._frame_positions.get('ZSTACK')
+            if positions:
+                result['Z'] = float(min(set(positions)))
+            else:
+                info = self._axis_info.get('ZSTACK', {})
+                start = info.get('start', 0.0)
+                if start != 0.0:
+                    result['Z'] = start
+        if 'Y' in sizes and self._pixel_length_y > 0:
+            result['Y'] = 0.0
+        if 'X' in sizes and self._pixel_length_x > 0:
+            result['X'] = 0.0
+        return result
+
+    @cached_property
+    def coord_scales(self) -> dict[str, float]:
+        """Coordinate step sizes per axis.
+
+        Map dimension character codes to the spacing between consecutive
+        coordinate values. Only axes with numeric, regularly spaced
+        coordinates are included.
+
+        """
+        result: dict[str, float] = {}
+        sizes = self.sizes
+        if 'T' in sizes and sizes['T'] > 1:
+            positions = self._frame_positions.get('TIMELAPSE')
+            if positions:
+                t_sorted = sorted(set(positions))
+                if len(t_sorted) > 1:
+                    result['T'] = t_sorted[1] - t_sorted[0]
+            else:
+                info = self._axis_info.get('TIMELAPSE', {})
+                step = info.get('step', 1.0)
+                if step != 1.0:
+                    result['T'] = step
+        if 'L' in sizes and sizes['L'] > 1:
+            positions = self._frame_positions.get('LAMBDA')
+            if positions:
+                l_sorted = sorted(set(positions))
+                if len(l_sorted) > 1:
+                    result['L'] = l_sorted[1] - l_sorted[0]
+            else:
+                info = self._axis_info.get('LAMBDA', {})
+                step = info.get('step', 1.0)
+                if step != 1.0:
+                    result['L'] = step
+        if 'Z' in sizes and sizes['Z'] > 1:
+            positions = self._frame_positions.get('ZSTACK')
+            if positions:
+                z_sorted = sorted(set(positions))
+                if len(z_sorted) > 1:
+                    result['Z'] = z_sorted[1] - z_sorted[0]
+            else:
+                info = self._axis_info.get('ZSTACK', {})
+                step = info.get('step', 1.0)
+                if step != 1.0:
+                    result['Z'] = step
+        if (
+            'Y' in sizes
+            and sizes['Y'] > 1
+            and self._pixel_length_y > 0
+            and self._frame.height > 0
+        ):
+            result['Y'] = self._pixel_length_y / self._frame.height
+        if 'X' in sizes and sizes['X'] > 1 and self._pixel_length_x > 0:
+            result['X'] = self._pixel_length_x / sizes['X']
+        return result
+
+    @cached_property
+    def reference(self) -> OirReference | None:
+        """Reference image, or None if not present.
+
+        Reference images are full-field overview images stored alongside
+        certain acquisition modes like line or point scans.
+
+        """
+        if not self._ref_pixel_map:
+            return None
+
+        # compute height and width from total pixel count of first channel
+        first_blocks = next(iter(self._ref_pixel_map.values()))
+        total_bytes = sum(length for _, length in first_blocks)
+        total_pixels = total_bytes // self._frame.depth
+        if total_pixels == 0:
+            return None
+
+        # try perfect square first, then fall back to main frame width
+        sq = math.isqrt(total_pixels)
+        if sq * sq == total_pixels:
+            width = sq
+            height = sq
+        elif self._frame.width > 0 and total_pixels % self._frame.width == 0:
+            width = self._frame.width
+            height = total_pixels // self._frame.width
+        else:
+            width = total_pixels
+            height = 1
+
+        return OirReference(
+            self, height, width, self._ref_pixel_map, self._line_roi
+        )
+
+    @cached_property
+    def thumbnail(self) -> bytes | None:
+        """Thumbnail image as BMP bytes, or None if not present.
+
+        Returns raw Windows BMP file bytes that can be written to a ``.bmp``
+        file or decoded with an image library.
+
+        """
+        if self._bmp_block is None:
+            return None
+        offset, length = self._bmp_block
+        self._fh.seek(offset)
+        data = self._fh.read(length)
+        # strip OIR-specific 'BMP ' 4-byte prefix
+        if data[:4] == b'BMP ':
+            data = data[4:]
+        return data
 
     def _get_ordered_channel_guids(self) -> list[str]:
         """Return channel GUIDs in order from pixel map."""
@@ -1053,8 +1310,8 @@ class OirFile(BinaryFile):
         """Image metadata as dict."""
         result: dict[str, Any] = {
             'filepath': self._path,
-            'bitspersample': self._frame.bitspersample,
-            'colortype': self._frame.colortype,
+            'bitspersample': self.bitspersample,
+            'colortype': self.colortype,
         }
 
         if self._channels:
@@ -1211,6 +1468,7 @@ class OirFile(BinaryFile):
         return indent(
             repr(self),
             f'path: {self._path}',
+            self.reference or '',
         )
 
     @override
@@ -1225,7 +1483,7 @@ class PoirFile(collections.abc.Mapping[str, OirFile]):
 
     POIR files are ZIP archives containing one or more OIR files.
     ``PoirFile`` implements the :py:class:`collections.abc.Mapping` interface,
-    mapping OIR file names (without directory) to lazily opened
+    mapping OIR file paths within the archive to lazily opened
     :py:class:`OirFile` instances.
 
     ``PoirFile`` instances must be closed with :py:meth:`PoirFile.close`,
@@ -1320,6 +1578,248 @@ class PoirFile(collections.abc.Mapping[str, OirFile]):
         traceback: TracebackType | None,
     ) -> None:
         self.close()
+
+
+class OirReference:
+    """Reference image from OIR file.
+
+    Reference images are full-field overview images stored alongside
+    certain acquisition modes like line scans.
+    They are 2D ``(Y, X)`` or 3D ``(C, Y, X)`` arrays of the same
+    :py:attr:`dtype` as the main image.
+
+    ``OirReference`` objects are returned by :py:attr:`OirFile.reference`
+    and should not be created directly. They hold a reference to the parent
+    :py:class:`OirFile` and become invalid after it is closed.
+
+    """
+
+    _oir: OirFile
+    _height: int
+    _width: int
+    _pixel_map: dict[str, list[tuple[int, int]]]
+    _line_roi: tuple[float, float, float, float] | None
+
+    def __init__(
+        self,
+        oir: OirFile,
+        height: int,
+        width: int,
+        pixel_map: dict[str, list[tuple[int, int]]],
+        line_roi: tuple[float, float, float, float] | None,
+        /,
+    ) -> None:
+        self._oir = oir
+        self._height = height
+        self._width = width
+        self._pixel_map = pixel_map
+        self._line_roi = line_roi
+
+    @property
+    def dtype(self) -> numpy.dtype[Any]:
+        """NumPy data type of reference image."""
+        return self._oir._frame.dtype
+
+    @cached_property
+    def sizes(self) -> dict[str, int]:
+        """Ordered mapping of dimension name to length."""
+        sizes: dict[str, int] = {}
+        if len(self._pixel_map) > 1:
+            sizes['C'] = len(self._pixel_map)
+        sizes['Y'] = self._height
+        sizes['X'] = self._width
+        return sizes
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Shape of reference image."""
+        return tuple(self.sizes.values())
+
+    @property
+    def dims(self) -> tuple[str, ...]:
+        """Dimension names of reference image."""
+        return tuple(self.sizes.keys())
+
+    @property
+    def ndim(self) -> int:
+        """Number of reference image dimensions."""
+        return len(self.sizes)
+
+    @property
+    def size(self) -> int:
+        """Number of elements in reference image."""
+        s = 1
+        for v in self.sizes.values():
+            s *= v
+        return s
+
+    @property
+    def nbytes(self) -> int:
+        """Number of bytes consumed by reference image."""
+        return self.size * self.dtype.itemsize
+
+    @property
+    def line_roi(self) -> tuple[float, float, float, float] | None:
+        """Line ROI coordinates ``(x1, y1, x2, y2)``, or None."""
+        return self._line_roi
+
+    @cached_property
+    def attrs(self) -> dict[str, Any]:
+        """Selected metadata as dict."""
+        result: dict[str, Any] = {}
+        if self._line_roi is not None:
+            result['line_roi'] = self._line_roi
+        return result
+
+    @cached_property
+    def coords(self) -> dict[str, NDArray[Any]]:
+        """Mapping of dimension names to physical coordinate arrays."""
+        result: dict[str, NDArray[Any]] = {}
+        if 'C' in self.sizes:
+            guids = self._get_ordered_guids()
+            names = []
+            for guid in guids:
+                ch = next(
+                    (c for c in self._oir._channels if c.id == guid), None
+                )
+                names.append(ch.name if ch else guid)
+            result['C'] = numpy.array(names)
+        plx = self._oir._pixel_length_x
+        ply = self._oir._pixel_length_y
+        if ply > 0 and self._height > 0:
+            step = ply / self._height
+            result['Y'] = numpy.linspace(
+                0.0, (self._height - 1) * step, self._height
+            )
+        if plx > 0 and self._width > 0:
+            step = plx / self._width
+            result['X'] = numpy.linspace(
+                0.0, (self._width - 1) * step, self._width
+            )
+        return result
+
+    @cached_property
+    def coord_units(self) -> dict[str, str]:
+        """Coordinate unit strings per axis."""
+        units: dict[str, str] = {}
+        if self._oir._pixel_length_y > 0:
+            units['Y'] = 'µm'
+        if self._oir._pixel_length_x > 0:
+            units['X'] = 'µm'
+        return units
+
+    @cached_property
+    def coord_offsets(self) -> dict[str, float]:
+        """Coordinate offsets (first pixel position) per axis.
+
+        Map dimension character codes to the coordinate value of the
+        first pixel. Only axes with numeric coordinates are included.
+
+        """
+        result: dict[str, float] = {}
+        if self._oir._pixel_length_y > 0:
+            result['Y'] = 0.0
+        if self._oir._pixel_length_x > 0:
+            result['X'] = 0.0
+        return result
+
+    @cached_property
+    def coord_scales(self) -> dict[str, float]:
+        """Coordinate step sizes per axis.
+
+        Map dimension character codes to the spacing between consecutive
+        coordinate values. Only axes with numeric, regularly spaced
+        coordinates are included.
+
+        """
+        result: dict[str, float] = {}
+        ply = self._oir._pixel_length_y
+        plx = self._oir._pixel_length_x
+        if ply > 0 and self._height > 1:
+            result['Y'] = ply / self._height
+        if plx > 0 and self._width > 1:
+            result['X'] = plx / self._width
+        return result
+
+    def _get_ordered_guids(self) -> list[str]:
+        """Return channel GUIDs in order."""
+        guids = set(self._pixel_map)
+        ordered: list[str] = []
+        for ch in self._oir._channels:
+            if ch.id in guids:
+                ordered.append(ch.id)
+                guids.discard(ch.id)
+        ordered.extend(sorted(guids))
+        return ordered
+
+    def asarray(self, *, out: OutputType = None) -> NDArray[Any]:
+        """Return reference image data as NumPy array.
+
+        Parameters:
+            out:
+                Output destination for image data.
+                Passed to :py:func:`create_output`.
+
+        Returns:
+            NumPy array containing reference image data.
+
+        """
+        shape = self.shape
+        dtype = self.dtype
+        data = create_output(out, shape=shape, dtype=dtype, fillvalue=0)
+        fh = self._oir._fh
+        guids = self._get_ordered_guids()
+        has_c = 'C' in self.sizes
+        for ci, guid in enumerate(guids):
+            blocks = self._pixel_map[guid]
+            chunks = []
+            for offset, length in blocks:
+                fh.seek(offset)
+                chunks.append(fh.read(length))
+            plane_bytes = b''.join(chunks)
+            plane = numpy.frombuffer(plane_bytes, dtype=dtype)
+            expected = self._height * self._width
+            if len(plane) >= expected:
+                plane = plane[:expected].reshape(self._height, self._width)
+                if has_c:
+                    data[ci] = plane
+                else:
+                    data[:] = plane
+        return data
+
+    def asxarray(self, *, out: OutputType = None) -> DataArray:
+        """Return reference image data as xarray DataArray.
+
+        Parameters:
+            out:
+                Output destination for image data.
+                Passed to :py:meth:`asarray`.
+
+        Returns:
+            :py:class:`xarray.DataArray`
+                Reference image data with coordinates and dimensions.
+
+        """
+        from xarray import DataArray
+
+        return DataArray(
+            self.asarray(out=out),
+            coords=self.coords,
+            dims=self.dims,
+            name='reference',
+            attrs=self.attrs,
+        )
+
+    def __str__(self) -> str:
+        info = [repr(self)]
+        if self._line_roi is not None:
+            x1, y1, x2, y2 = self._line_roi
+            info.append(f'line_roi: ({x1}, {y1}, {x2}, {y2})')
+        return indent(*info)
+
+    def __repr__(self) -> str:
+        dims = ', '.join(f'{k}: {v}' for k, v in self.sizes.items())
+        return f'<OirReference ({dims}) {self.dtype}>'
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1611,6 +2111,19 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(oir.name, exc)
             return False
+
+        ref = oir.reference
+        if ref is not None:
+            with contextlib.suppress(Exception):
+                if xarray is not None:
+                    xa = ref.asxarray()
+                    data = xa.data
+                    print(xa)
+                else:
+                    data = ref.asarray()
+                    print(data)
+                print()
+
         if not plot or imshow is None or data.ndim < 2:
             return False
         try:
@@ -1625,6 +2138,45 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(oir.name, exc)
             return False
+
+        if ref is not None:
+            try:
+                ref_data = ref.asarray()
+                if ref_data.ndim >= 2:
+                    # show reference as separate figure
+                    _fig, ax = pyplot.subplots()
+                    ax.set_title(repr(ref))
+                    ax.imshow(
+                        ref_data if ref_data.ndim == 2 else ref_data[0],
+                        # cmap='gray',
+                        interpolation='none',
+                    )
+                    if ref.line_roi is not None:
+                        x1, y1, x2, y2 = ref.line_roi
+                        ax.plot(
+                            [x1, x2],
+                            [y1, y2],
+                            color='red',
+                            linewidth=1.5,
+                            label='line ROI',
+                        )
+                        ax.legend()
+            except Exception as exc:
+                print('reference', exc)
+
+        try:
+            bmp = oir.thumbnail
+            if bmp is not None:
+                # show thumbnail as separate figure
+                _fig, ax = pyplot.subplots()
+                ax.set_title('Thumbnail')
+                ax.imshow(
+                    pyplot.imread(io.BytesIO(bmp), format='bmp'),
+                    interpolation='none',
+                )
+        except Exception as exc:
+            print('reference', exc)
+
         return True
 
     for fname in files:
